@@ -7,8 +7,9 @@
 
 import preact from "../js/lib/preact";
 import { PSLoginServer } from "./client-connection";
+import { PSBackground } from "./client-core";
 import { Config, PS, PSRoom, type RoomID, type RoomOptions, type Team } from "./client-main";
-import { PSIcon, PSPanelWrapper, PSRoomPanel } from "./panels";
+import { PSIcon, PSPanelErrorBoundary, PSPanelWrapper, PSRoomPanel } from "./panels";
 import type { BattlesRoom } from "./panel-battle";
 import type { ChatRoom } from "./panel-chat";
 import type { LadderFormatRoom } from "./panel-ladder";
@@ -141,9 +142,12 @@ export class MainMenuRoom extends PSRoom {
 			});
 			return;
 		} case 'updateuser': {
-			const [, fullName, namedCode, avatar] = args;
+			const [, fullName, namedCode, avatar, settingsJSON] = args;
 			const named = namedCode === '1';
 			if (named) PS.user.initializing = false;
+			if (settingsJSON) {
+				PS.prefs.set('serversettings', { ...PS.prefs.serversettings, ...JSON.parse(settingsJSON) });
+			}
 			PS.user.setName(fullName, named, avatar);
 			PS.teams.loadRemoteTeams();
 			return;
@@ -165,11 +169,15 @@ export class MainMenuRoom extends PSRoom {
 			let sideRoom = PS.rightPanel as ChatRoom;
 			if (sideRoom?.type === "chat" && PS.prefs.inchatpm) sideRoom?.log?.add(args);
 			return;
+		} case 'customgroups': {
+			const [, groupsList] = args;
+			PS.server.parseGroups(groupsList);
+			return;
 		} case 'formats': {
 			this.parseFormats(args);
 			return;
 		} case 'popup': {
-			const [, message] = args;
+			let [, message] = args;
 			for (const roomid in PS.rooms) {
 				const room = PS.rooms[roomid] as ChatRoom | MainMenuRoom;
 				if (room.teamSent) {
@@ -178,7 +186,12 @@ export class MainMenuRoom extends PSRoom {
 				}
 				if (room.type === 'team') (room as any).cancelUpload();
 			}
-			PS.alert(message.replace(/\|\|/g, '\n'));
+			let width: number | undefined;
+			if (message.startsWith('|wide|')) {
+				message = message.slice(6);
+				width = 960;
+			}
+			PS.alert(message.replace(/\|\|/g, '\n'), { width });
 			return;
 		}
 		}
@@ -250,6 +263,7 @@ export class MainMenuRoom extends PSRoom {
 				let partner = false;
 				let bestOfDefault = false;
 				let teraPreviewDefault = false;
+				let itemClauseDefault = false;
 				let team: 'preset' | null = null;
 				let teambuilderLevel: number | null = null;
 				let lastCommaIndex = name.lastIndexOf(',');
@@ -264,6 +278,7 @@ export class MainMenuRoom extends PSRoom {
 					if (code & 32) partner = true;
 					if (code & 64) bestOfDefault = true;
 					if (code & 128) teraPreviewDefault = true;
+					if (code & 256) itemClauseDefault = true;
 				} else {
 					// Backwards compatibility: late 0.9.0 -> 0.10.0
 					if (name.substr(name.length - 2) === ',#') { // preset teams
@@ -327,6 +342,7 @@ export class MainMenuRoom extends PSRoom {
 					tournamentShow,
 					bestOfDefault,
 					teraPreviewDefault,
+					itemClauseDefault,
 					rated: searchShow && id.substr(4, 7) !== 'unrated',
 					teambuilderLevel,
 					partner,
@@ -381,9 +397,9 @@ export class MainMenuRoom extends PSRoom {
 	 * Most queries are still handled hardcoded, so this is only for certain
 	 * special queries that need a Promise.
 	 */
-	makeQuery(id: string, param?: string) {
+	makeQuery(id: string, param?: string, excludeParamFromListener?: boolean) {
 		let fullid = id;
-		if (param) fullid += ` ${toID(param)}`;
+		if (param && !excludeParamFromListener) fullid += ` ${toID(param)}`;
 		return new Promise<any>(resolve => {
 			if (!this.listeners[fullid]) {
 				this.listeners[fullid] = [];
@@ -402,6 +418,7 @@ export class MainMenuRoom extends PSRoom {
 			if (!userdetails) {
 				this.userdetailsCache[userid] = response;
 			} else {
+				response.status ||= '';
 				Object.assign(userdetails, response);
 			}
 			PS.rooms[`user-${userid}`]?.update(null);
@@ -446,6 +463,7 @@ export class MainMenuRoom extends PSRoom {
 		case 'teamupload':
 			if (PS.teams.uploading) {
 				const team = PS.teams.uploading;
+				team.teamid = response.teamid;
 				team.uploaded = {
 					teamid: response.teamid,
 					notLoaded: false,
@@ -484,18 +502,26 @@ class NewsPanel extends PSRoomPanel {
 	static readonly location = 'mini-window';
 	change = (ev: Event) => {
 		const target = ev.currentTarget as HTMLInputElement;
-		if (target.value === '1') {
-			document.cookie = "preactalpha=1; expires=Thu, 1 Jun 2026 12:00:00 UTC; path=/";
+		this.setClient(target.value as '0' | '1' | 'leave');
+	};
+	setClient(setting: '0' | '1' | 'leave') {
+		if (setting === '1') {
+			document.cookie = "preactalpha=1; expires=Thu, 1 Aug 2026 12:00:00 UTC; path=/";
+		} else if (setting === '0') {
+			document.cookie = "preactalpha=0; expires=Thu, 1 Aug 2026 12:00:00 UTC; path=/";
 		} else {
 			document.cookie = "preactalpha=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
 		}
-		if (target.value === 'leave') {
+		if (setting === 'leave') {
 			document.location.href = `/`;
 		}
-	};
+	}
+	override componentDidMount() {
+		if (!document.cookie.includes('preactalpha=')) this.setClient('1');
+	}
 	override render() {
-		const cookieSet = document.cookie.includes('preactalpha=1');
-		return <PSPanelWrapper room={this.props.room} fullSize scrollable>
+		const cookieSet = !document.cookie.includes('preactalpha=0');
+		return <PSPanelWrapper room={this.props.room} fullSize>
 			<div class="construction">
 				This is the client rewrite beta test.
 				<form>
@@ -524,6 +550,10 @@ class MainMenuPanel extends PSRoomPanel<MainMenuRoom> {
 	static readonly routes = [''];
 	static readonly Model = MainMenuRoom;
 	static readonly icon = <i class="fa fa-home" aria-hidden></i>;
+	override componentDidMount() {
+		super.componentDidMount();
+		this.subscribeTo(PSBackground);
+	}
 	override focus() {
 		this.base?.querySelector<HTMLButtonElement>('.formatselect')?.focus();
 	}
@@ -549,7 +579,7 @@ class MainMenuPanel extends PSRoomPanel<MainMenuRoom> {
 		const draggingRoom = PS.dragging.roomid;
 		if (draggingRoom === null) return;
 
-		const draggedOverRoom = PS.getRoom(e.target as HTMLElement);
+		const draggedOverRoom = PS.getRoom(e.target);
 		if (draggingRoom === draggedOverRoom?.id) return;
 
 		const index = PS.miniRoomList.indexOf(draggedOverRoom?.id as any);
@@ -564,9 +594,7 @@ class MainMenuPanel extends PSRoomPanel<MainMenuRoom> {
 		// if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
 	};
 	renderMiniRoom(room: PSRoom) {
-		const RoomType = PS.roomTypes[room.type];
-		const Panel = RoomType || PSRoomPanel;
-		return <Panel key={room.id} room={room} />;
+		return <PSPanelErrorBoundary key={room.id} room={room} />;
 	}
 	handleClickMinimize = (e: MouseEvent) => {
 		if ((e.target as Element)?.getAttribute('data-cmd')) {
@@ -663,14 +691,14 @@ class MainMenuPanel extends PSRoomPanel<MainMenuRoom> {
 				</button></p>
 			{PS.mainmenu.searchCountdown ? (
 				<>
-					<button class="mainmenu1 mainmenu big button disabled" type="submit"><strong>
+					<button class="mainmenu1 mainmenu big button disabled" disabled><strong>
 						<i class="fa fa-refresh fa-spin" aria-hidden></i> Searching in {PS.mainmenu.searchCountdown.countdown}...
 					</strong></button>
 					<p class="buttonbar"><button class="button" data-cmd="/cancelsearch">Cancel</button></p>
 				</>
 			) : PS.mainmenu.searchingFormat() ? (
 				<>
-					<button class="mainmenu1 mainmenu big button disabled" type="submit">
+					<button class="mainmenu1 mainmenu big button disabled" disabled>
 						<strong><i class="fa fa-refresh fa-spin" aria-hidden></i> Searching...</strong>
 					</button>
 					<p class="buttonbar"><button class="button" data-cmd="/cancelsearch">Cancel</button></p>
@@ -683,11 +711,23 @@ class MainMenuPanel extends PSRoomPanel<MainMenuRoom> {
 			)}
 		</TeamForm>;
 	}
+	renderBackgroundCredit() {
+		const attrib = PSBackground.attrib;
+		if (!attrib) return null;
+		return (
+			<small>
+				<a href={attrib.url} target="_blank" class="subtle">"{attrib.title}" <small>background by {attrib.artist}</small></a>
+			</small>
+		);
+	}
 	override render() {
 		const onlineButton = ' button' + (PS.isOffline ? ' disabled' : '');
 		const tinyLayout = this.props.room.width < 620 ? ' tiny-layout' : '';
-		return <PSPanelWrapper room={this.props.room} scrollable onDragEnter={this.handleDragEnter}>
+		return <PSPanelWrapper room={this.props.room} onDragEnter={this.handleDragEnter}>
 			<div class={`mainmenu-mini-windows${tinyLayout}`}>
+				{!PS.leftPanelWidth && Config.includes?.mainmenuHTML && (
+					<div dangerouslySetInnerHTML={{ __html: Config.includes.mainmenuHTML }} />
+				)}
 				{this.renderMiniRooms()}
 			</div>
 			<div class={`mainmenu${tinyLayout}`}>
@@ -718,17 +758,47 @@ class MainMenuPanel extends PSRoomPanel<MainMenuRoom> {
 					</div>
 				</div>
 				<div class="mainmenu-footer">
-					<div class="bgcredit"></div>
+					<div class="bgcredit">{this.renderBackgroundCredit()}</div>
 					<small>
 						<a href={`//${Config.routes.dex}/`} target="_blank">Pok&eacute;dex</a> | {}
 						<a href={`//${Config.routes.replays}/`} target="_blank">Replays</a> | {}
+						<a href="//smogon.com/forums/" target="_blank">Forum</a> | {}
 						<a href={`//${Config.routes.root}/rules`} target="_blank">Rules</a> | {}
 						<a href={`//${Config.routes.root}/credits`} target="_blank">Credits</a> | {}
-						<a href="//smogon.com/forums/" target="_blank">Forum</a>
+						<a href={`//${Config.routes.root}/privacy`} target="_blank">Privacy</a>
 					</small>
+					<CCPAIntercept />
 				</div>
 			</div>
 		</PSPanelWrapper>;
+	}
+}
+
+export class CCPAIntercept extends preact.Component {
+	intercepted = false;
+	override shouldComponentUpdate() {
+		this.intercept();
+		return false;
+	}
+	override componentDidMount() {
+		this.intercept();
+		setTimeout(() => this.intercept(), 500);
+		setTimeout(() => this.intercept(), 1000);
+		setTimeout(() => this.intercept(), 2000);
+		setTimeout(() => this.intercept(), 3000);
+		setTimeout(() => this.intercept(), 5000);
+		setTimeout(() => this.intercept(), 10000);
+	}
+	intercept() {
+		if (this.intercepted || !window.$) return;
+		const $ccpa = $('.fc-dns-dialog');
+		if (!$ccpa.length) return;
+		$ccpa.appendTo(this.base!);
+		// $ccpa.css({ position: 'relative', zIndex: 2 });
+		this.intercepted = true;
+	}
+	override render() {
+		return <div></div>;
 	}
 }
 
@@ -808,6 +878,7 @@ class TeamDropdown extends preact.Component<{ format: string }> {
 		return <button
 			name="team" value={this.teamKey}
 			class="select teamselect" data-href="/teamdropdown" data-format={teamFormat} onChange={this.change}
+			disabled={!!PS.mainmenu.searchingFormat()}
 		>
 			{PS.roomTypes['teamdropdown'] && <TeamBox team={team} noLink />}
 		</button>;
@@ -824,6 +895,7 @@ export class TeamForm extends preact.Component<{
 	format = '';
 	teraPreview = false;
 	bestOf = false;
+	itemClause = false;
 	changeFormat = (ev: Event) => {
 		this.format = (ev.target as HTMLButtonElement).value;
 	};
@@ -850,6 +922,10 @@ export class TeamForm extends preact.Component<{
 			const value = this.base?.querySelector<HTMLInputElement>('input[name=bestofvalue]')?.value;
 			format = `${format}${hasCustomRules ? `, Best of = ${value!}` : `@@@ Best of = ${value!}`}`;
 		}
+		if (this.itemClause) {
+			const hasCustomRules = format.includes('@@@');
+			format = `${format}${hasCustomRules ? ', Item Clause = 1' : '@@@ Item Clause = 1'}`;
+		}
 		PS.teams.loadTeam(team).then(() => {
 			(validate === 'validate' ? this.props.onValidate : this.props.onSubmit)?.(ev, format, team);
 		});
@@ -859,6 +935,7 @@ export class TeamForm extends preact.Component<{
 		const rule = (ev.target as HTMLInputElement)?.name;
 		if (rule === 'terapreview') this.teraPreview = checked;
 		if (rule === 'bestof') this.bestOf = checked;
+		if (rule === 'itemclause=1') this.itemClause = checked;
 	};
 	handleClick = (ev: Event) => {
 		let target = ev.target as HTMLButtonElement | null;
@@ -926,6 +1003,11 @@ export class TeamForm extends preact.Component<{
 							name="bestofvalue" type="number" min="3" max="9" step="2" value="3" style="width: 28px; vertical-align: initial;"
 						/>
 					</abbr></label></p>}
+			{this.props.selectType === 'challenge' &&
+				window.BattleFormats[formatId]?.itemClauseDefault && <p>
+				<label class="checkbox">
+					<input type="checkbox" name="itemclause" onChange={this.toggleCustomRule} />
+					<abbr title="Start a battle with Item Clause">Item Clause</abbr></label></p>}
 			<p>{this.props.children}</p>
 		</form>;
 	}
